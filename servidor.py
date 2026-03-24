@@ -2,9 +2,8 @@ import socket
 import threading
 import json
 
-HOST = '0.0.0.0'
+HOST = '192.168.1.7'
 PORT = 5000
-
 SERVER_UUID = "MASTER"
 
 
