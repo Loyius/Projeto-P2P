@@ -2,9 +2,9 @@ import socket
 import threading
 import json
 
-HOST = '192.168.1.7'
+HOST = '10.62.217.42'
 PORT = 5000
-SERVER_UUID = "MASTER"
+SERVER_UUID = "MASTER_1"
 
 
 def handle_client(conn, addr):
@@ -49,6 +49,11 @@ def handle_client(conn, addr):
 
 
 def start_server():
+    client_heartbeat = threading.Thread(target=heartbeat)
+    client_heartbeat.start()
+    client_heartbeat.join()
+    
+def heartbeat():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((HOST, PORT))
     server.listen()
@@ -61,6 +66,7 @@ def start_server():
         # Thread para cada conexão (concorrência)
         client_thread = threading.Thread(target=handle_client, args=(conn, addr))
         client_thread.start()
+    
 
 
 if __name__ == "__main__":

@@ -3,11 +3,10 @@ import json
 import schedule
 import time
 
-HOST = '192.168.1.7'
+HOST = '10.62.217.42'
 PORT = 5000
 
-WORKER_UUID = "WORKER-CC"
-SERVER_UUID = "MASTER"
+SERVER_UUID = "MASTER_1"
 
 
 def send_heartbeat():
@@ -17,7 +16,6 @@ def send_heartbeat():
 
             payload = {
                 "SERVER_UUID": SERVER_UUID,
-                "WORKER_UUID": WORKER_UUID,
                 "TASK": "HEARTBEAT"
             }
 
@@ -42,15 +40,19 @@ def send_heartbeat():
         print(f"[WORKER] Erro de conexão: {e}")
 
 
-def main():
-    # Agenda o heartbeat a cada 5 segundos
-    schedule.every(5).seconds.do(send_heartbeat)
-
+def heartbeat():
     print("[WORKER] Iniciando envio de heartbeat...")
+    # Executa imediatamente a primeira vez
+    send_heartbeat()
+
+    # Agenda o heartbeat a cada 30 segundos
+    schedule.every(30).seconds.do(send_heartbeat)
 
     while True:
         schedule.run_pending()
         time.sleep(1)
+def main():
+    heartbeat()
 
 
 if __name__ == "__main__":
