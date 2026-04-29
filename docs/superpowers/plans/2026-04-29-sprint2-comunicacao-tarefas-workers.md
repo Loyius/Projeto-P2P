@@ -156,7 +156,7 @@ Inicializar a fila no arranque com pelo menos um item de teste, por exemplo:
 ```python
 def seed_queue():
     with state_lock:
-        task_queue.append({"USER": "demo-user"})
+        task_queue.append({"USER": "demo-user", "A": 2, "B": 2})
 ```
 
 Chamar `seed_queue()` em `start_server`/`heartbeat` antes do `listen`, ou expor lista inicial editável.
@@ -173,11 +173,13 @@ def send_json_line(conn, obj: dict) -> None:
 Após `payload = json.loads(message)`:
 
 1. Tentar interpretar como **relatório de status**: se `"STATUS" in payload` e `"TASK" in payload`:
-   - `try: validate_status_report(payload) except ValueError: log; return` e **fechar** tratamento desta mensagem sem ACK (não enviar ACK).
+   - `try: validate_status_report(payload) except ValueError: log; return` e **fechar** tratamento desta mensagem sem ACK (não enviar ACK). **Nota:** distinguir dois casos: (a) `validate_status_report` **lança exceção** (payload malformado, campo ausente, valor inválido) → **não enviar ACK**, fechar conexão após log; (b) `validate_status_report` **passa** e `STATUS == "NOK"` (worker reportou falha legítima na tarefa) → **enviar ACK normalmente**, logar a falha, remover pendente — como no CT05 do projeto.
    - `wid = payload["WORKER_UUID"]`; com `state_lock`, se `wid` não está em `pending` ou `pending[wid]["USER"]` não coincide com o esperado — na sprint, basta verificar que `pending[wid]` existe e `pending[wid].get("TASK") == TASK_QUERY`; opcionalmente guardar `"USER"` no pendente e exigir igualdade se o relatório incluir `USER` (não obrigatório na spec — não exigir).
-   - Se válido: `print` log com worker, USER do pendente, STATUS; `del pending_by_worker[wid]`; `send_json_line(conn, {"STATUS": STATUS_ACK})`.
+   - Se válido: `print` log com worker, USER do pendente, STATUS; `del pending_by_worker[wid]`; `send_json_line(conn, {"STATUS": STATUS_ACK, "WORKER_UUID": wid})`.
+   - Após enviar o ACK, executar `return` imediatamente para encerrar o handler. O bloco `finally` existente chama `conn.close()`, fechando a conexão de forma determinística. Não aguardar mais dados do worker nesta conexão.
 2. **Senão**, tratar como **handshake**:
    - `validate_worker_handshake`; se falhar, log e **não** enviar tarefa.
+   - `wid = payload["WORKER_UUID"]`. Verificar `payload.get("SERVER_UUID")`: se presente, logar `[MASTER] Worker {wid} é emprestado do Master {server_uuid}`. Comportamento de despacho de tarefa não se altera — CT02 exige reconhecimento e log, não lógica diferente.
    - Com lock: se fila vazia → `send_json_line({"TASK": TASK_NO_TASK})`.
    - Senão: `item = task_queue.popleft()`; `pending_by_worker[wid] = {"TASK": TASK_QUERY, "USER": item["USER"]}`; `send_json_line({"TASK": TASK_QUERY, "USER": item["USER"]})`.
 
@@ -221,9 +223,12 @@ from protocol import (
 HOST = os.environ.get("P2P_HOST", "127.0.0.1")
 PORT = int(os.environ.get("P2P_PORT", "5000"))
 WORKER_UUID = os.environ.get("P2P_WORKER_UUID", str(uuid.uuid4()))
+ORIGIN_MASTER_UUID = os.environ.get("P2P_ORIGIN_MASTER_UUID", "").strip()
 READ_TIMEOUT_SEC = 5.0
 NO_TASK_SLEEP_SEC = 30
 ```
+
+- **Emprestado (CT02):** se `P2P_ORIGIN_MASTER_UUID` estiver definido e não vazio, o handshake inclui `SERVER_UUID` com esse valor (Master de origem); o Master regista em log e mantém o despacho igual.
 
 - [ ] **Step 2: Função `recv_json_line(sock) -> dict`**
 
@@ -235,7 +240,8 @@ Abrir `socket`, `connect`, enviar:
 
 ```python
 handshake = {"WORKER": "ALIVE", "WORKER_UUID": WORKER_UUID}
-# opcional: if borrowed: handshake["SERVER_UUID"] = ...
+if ORIGIN_MASTER_UUID:
+    handshake["SERVER_UUID"] = ORIGIN_MASTER_UUID
 sock.sendall((json.dumps(handshake) + "\n").encode())
 reply = recv_json_line(sock)
 ```
@@ -258,19 +264,25 @@ body = {
 }
 ```
 
-Ler resposta; exigir `{"STATUS": STATUS_ACK}`; senão erro.
+Ler resposta; exigir `reply.get("STATUS") == STATUS_ACK` e `reply.get("WORKER_UUID") == WORKER_UUID` (presença de `WORKER_UUID` no ACK correspondente ao do worker); senão erro.
+
+Após confirmar o ACK, logar `[WORKER] ACK recebido — ciclo concluído`. O socket é fechado pelo bloco `finally` imediatamente após.
 
 - [ ] **Step 5: `run_worker_loop()`**
+
+O worker recebe `A` e `B` junto com a tarefa, calcula `result = A + B`, loga o resultado e passa-o para `report_status`. O `time.sleep` de simulação é removido.
 
 ```python
 while True:
     try:
-        user = request_task()
-        if user is None:
+        task = request_task()
+        if task is None:
             continue
-        time.sleep(random.uniform(0.5, 2.0))  # simulação
-        report_status(user, ok=True)
-    except (socket.timeout, OSError, ValueError, json.JSONDecodeError) as e:
+        user, a, b = task
+        result = a + b
+        print(f"[WORKER] Calculando {a} + {b} = {result}")
+        report_status(user, ok=True, result=result)
+    except (socket.timeout, OSError, ValueError, json.JSONDecodeError, ConnectionError) as e:
         print(f"[WORKER] erro: {e}; a tentar de novo...")
         time.sleep(1)
 ```
@@ -325,7 +337,7 @@ git commit -m "test(sprint2): integration tests for master-worker task cycle"
 
 ## Revisão do plano (self-review)
 
-1. **Cobertura da spec:** Handshake, `QUERY`/`NO_TASK`, status+`ACK`, fila, pendente, timeouts, espera 30 s, parsing estrito — mapeados às Tarefas 1–4. Política explícita: falha de `validate_status_report` ou pendente inexistente → **sem ACK**, conexão termina após possível resposta vazia ou só log (implementação mínima: fechar sem ACK).
+1. **Cobertura da spec:** Handshake, `QUERY`/`NO_TASK`, status+`ACK`, fila, pendente, timeouts, espera 30 s, parsing estrito — mapeados às Tarefas 1–4. `SERVER_UUID` opcional: Worker envia via `P2P_ORIGIN_MASTER_UUID` quando emprestado; Master regista em log (CT02 coberto). Fechamento explícito de conexão após ACK implementado em ambos os lados (Master: `return` após `send_json_line` do ACK; Worker: log e `finally` com `sock.close()`). Política explícita: falha de `validate_status_report` ou pendente inexistente → **sem ACK**, conexão termina após possível resposta vazia ou só log (implementação mínima: fechar sem ACK).
 2. **Placeholders:** Nenhum TBD remanescente nas entregas obrigatórias; fila seed é intencionalmente “demo” configurável pelo aluno.
 3. **Consistência:** Nomes `TASK_QUERY`, funções de validação partilhadas entre master e testes.
 

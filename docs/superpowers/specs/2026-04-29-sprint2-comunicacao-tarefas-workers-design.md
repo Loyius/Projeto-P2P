@@ -39,11 +39,12 @@ Sistema de balanceamento P2P sobre **TCP** com mensagens **JSON** terminadas obr
 
 **Opcional:**
 
-- `"SERVER_UUID": "<string>"` — quando o worker é “emprestado” de outro Master; o Master pode registar em log e ignorar para a lógica de fila se não for usado na sprint.
+- `"SERVER_UUID": "<string>"` — presente quando o worker é "emprestado" de outro Master (identificador do **Master de origem**). O Master deve **registar em log** a origem do worker (`[MASTER] Worker {WORKER_UUID} é emprestado do Master {SERVER_UUID}`) e prosseguir com o despacho de tarefa normalmente. Lógica de negócio do empréstimo (redirecionamento, O5) fora do âmbito desta sprint.
+- **Implementação no Worker (`client.py`):** definir a variável de ambiente `P2P_ORIGIN_MASTER_UUID` com o identificador do Master de origem (string não vazia). Enquanto estiver definida, cada handshake de apresentação inclui `SERVER_UUID` com esse valor. Se não estiver definida ou estiver vazia, o worker não envia o campo (comportamento normal).
 
 **Resposta Master:**
 
-- Se existir tarefa na fila: `{"TASK": "QUERY", "USER": "<string>"}` e **registar pendente** para esse `WORKER_UUID`.
+- Se existir tarefa na fila: `{"TASK": "QUERY", "USER": "<string>", "A": <number>, "B": <number>}` e **registar pendente** para esse `WORKER_UUID`.
 - Se fila vazia: `{"TASK": "NO_TASK"}` (sem registo pendente).
 
 ### 3.3 Worker → Master (2ª conexão — resultado)
@@ -54,16 +55,28 @@ Sistema de balanceamento P2P sobre **TCP** com mensagens **JSON** terminadas obr
 - `"TASK": "QUERY"` — deve coincidir com a tarefa atribuída em memória para este `WORKER_UUID`.
 - `"WORKER_UUID": "<string>"` — igual ao da apresentação.
 
+**Opcional:**
+
+- `"RESULT": <number>` — resultado do cálculo quando o worker reporta sucesso ou inclui o valor enviado pelo worker (ex.: soma `A + B`).
+
+Exemplo com resultado:
+
+```json
+{"STATUS": "OK", "TASK": "QUERY", "WORKER_UUID": "<string>", "RESULT": <number>}
+```
+
 **Resposta Master:**
 
-- Se validação OK: **log** (worker, resultado, contexto útil da tarefa) e `{"STATUS": "ACK"}`; **remover** pendente.
+- Se validação OK: **log** (worker, resultado, contexto útil da tarefa) e `{"STATUS": "ACK", "WORKER_UUID": "<string>"}` — o campo `WORKER_UUID` **espelha** o UUID recebido no reporte; **remover** pendente.
+  - Após enviar o ACK, o Master **fecha a conexão imediatamente** (`return` no handler). O Worker, ao receber o ACK, loga o encerramento e fecha o socket pelo bloco `finally`. O ciclo está concluído — ambos os lados encerram a conexão de forma determinística sem aguardar timeout passivo.
 - Se validação falhar: ver §5 (não enviar `ACK` de confirmação válida sem critério claro — recomenda-se fechar ou mensagem de erro explícita; implementação deve ser **determinística** e documentada no plano).
 
 ### 3.4 Processamento no Worker
 
-- Após receber `QUERY` na 1ª conexão, **fechar conexão**, **simular trabalho** (sleep pseudoaleatório ou cálculo local).
+- Após receber `QUERY` na 1ª conexão, **fechar conexão**. O Worker recebe `A` e `B` na resposta `QUERY`, calcula `result = A + B`, e inclui `RESULT` no payload de status.
 - Abrir **nova conexão** e enviar o JSON de `STATUS`.
 - Após `ACK`, considerar ciclo concluído; pode iniciar novo ciclo (1ª conexão) para próxima tarefa.
+- Após receber o ACK, o Worker fecha o socket e considera o ciclo encerrado. Pode iniciar imediatamente um novo ciclo (1ª conexão) para a próxima tarefa.
 
 ### 3.5 Timeout (Worker)
 
@@ -87,7 +100,7 @@ Sistema de balanceamento P2P sobre **TCP** com mensagens **JSON** terminadas obr
 - **JSON inválido** ou linha incompleta além do timeout: descartar ou fechar; Master deve **logar**; Worker usa timeout de 5 s.
 - **Campos obrigatórios em falta:** Master **não** tratar como sucesso silencioso.
 - **`STATUS` sem pendente correspondente** ou `TASK`/`WORKER_UUID` incoerente: **não** confirmar com `ACK` como sucesso; fechar ou protocolo de erro acordado no plano.
-- **`NOK`:** mesmo fluxo de confirmação que `OK` após validação (tarefa considerada “fechada” do ponto de vista do worker; política de re-enfileiramento **fora do âmbito** salvo definição explícita no plano — default: **não** re-enfileirar automaticamente).
+- **`NOK` válido** (reporte `STATUS: "NOK"` que **passa** a validação estrutural): **mesmo fluxo** de confirmação que `OK` — o Master loga a falha da tarefa e envia `ACK` com `WORKER_UUID` como de costume; a tarefa fica “fechada” do ponto de vista do worker. A **ausência** de `ACK` aplica-se **exclusivamente** a payloads que **falham** na validação estrutural (JSON inválido, campos obrigatórios em falta, valores fora do protocolo), **não** ao `NOK` legítimo. Política de re-enfileiramento **fora do âmbito** salvo definição explícita no plano — default: **não** re-enfileirar automaticamente.
 
 ---
 
