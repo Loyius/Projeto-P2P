@@ -9,7 +9,7 @@ import schedule
 
 
 
-HOST = os.environ.get("P2P_HOST", "127.0.0.1")
+HOST = os.environ.get("P2P_HOST", "10.62.217.42")
 PORT = int(os.environ.get("P2P_PORT", "5000"))
 WORKER_UUID = os.environ.get("P2P_WORKER_UUID", str(uuid.uuid4()))
 # UUID do Master de origem quando o worker está emprestado a outro Master
@@ -40,26 +40,6 @@ def recv_json_line(sock: socket.socket) -> dict:
     line, _, _ = buffer.partition(b"\n")
     return json.loads(line.decode())
 
-# Função para solicitar uma tarefa
-def request_task() -> tuple[str, int | float, int | float] | None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.connect((HOST, PORT))
-        handshake = {"WORKER": WORKER_ALIVE, "WORKER_UUID": WORKER_UUID}
-        # Se o worker está emprestado a outro Master, inclui o SERVER_UUID no handshake
-        if ORIGIN_MASTER_UUID:
-            handshake["SERVER_UUID"] = ORIGIN_MASTER_UUID
-        sock.sendall((json.dumps(handshake) + "\n").encode())
-        reply = recv_json_line(sock)
-        if reply.get("TASK") == TASK_NO_TASK:
-            time.sleep(NO_TASK_SLEEP_SEC)
-            return None
-        if reply.get("TASK") == QUERY and "USER" in reply:
-            return reply["USER"], reply.get("A"), reply.get("B")
-        raise ValueError(f"resposta inesperada do master: {reply}")
-    finally:
-        sock.close()
-
 # Função para enviar heartbeat
 def send_heartbeat() -> None:
     try:
@@ -86,49 +66,55 @@ def _heartbeat_schedule_loop() -> None:
         time.sleep(1)
 
 
-#Relatório de status 
-def report_status(user: str, ok: bool, result=None) -> None:
-    _ = user 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.connect((HOST, PORT))
-        #payload
-        body = {
-            "STATUS": STATUS_OK if ok else STATUS_NOK,
-            "TASK": QUERY,
-            "WORKER_UUID": WORKER_UUID,
-            "RESULT": result,
-        }
-        sock.sendall((json.dumps(body) + "\n").encode())
-        reply = recv_json_line(sock)
-        if (
-            reply.get("STATUS") != STATUS_ACK
-            or reply.get("WORKER_UUID") != WORKER_UUID
-        ):
-            raise ValueError(f"ACK inválido: {reply}")
-        print(
-            f"[WORKER] ACK recebido — ciclo concluído para WORKER_UUID={WORKER_UUID}"
-        )
-    finally:
-        sock.close()
-
-
 def run_worker_loop() -> None:
     while True:
+        # Abre UMA conexão por ciclo completo (handshake + tarefa + relatório de status)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            # Solicita uma tarefa
-            task = request_task()
-            if task is None:
+            sock.connect((HOST, PORT))
+
+            # Solicita uma tarefa ao Master
+            handshake = {"WORKER": WORKER_ALIVE, "WORKER_UUID": WORKER_UUID}
+            # Se o worker está emprestado a outro Master, inclui o SERVER_UUID no handshake
+            if ORIGIN_MASTER_UUID:
+                handshake["SERVER_UUID"] = ORIGIN_MASTER_UUID
+            sock.sendall((json.dumps(handshake) + "\n").encode())
+            reply = recv_json_line(sock)
+
+            if reply.get("TASK") == TASK_NO_TASK:
+                # Sem tarefa disponível, aguarda antes de tentar novamente
+                time.sleep(NO_TASK_SLEEP_SEC)
                 continue
+
+            if not (reply.get("TASK") == QUERY and "USER" in reply):
+                raise ValueError(f"resposta inesperada do master: {reply}")
+
             # Extrai os valores de A e B da tarefa
-            user, a, b = task
+            user, a, b = reply["USER"], reply.get("A"), reply.get("B")
+
             # Calcula o resultado da tarefa
             result = a + b
             # Loga o resultado da tarefa
             print(f"[WORKER] Calculando {a} + {b} = {result}")
-            # Relatório de status
-            report_status(user, ok=True, result=result)
-            # Fechar conexão
+
+            # — Relatório de status: reutiliza o mesmo socket, sem fechar a conexão —
+            body = {
+                "STATUS": STATUS_OK,
+                "TASK": QUERY,
+                "WORKER_UUID": WORKER_UUID,
+                "RESULT": result,
+            }
+            sock.sendall((json.dumps(body) + "\n").encode())
+            ack = recv_json_line(sock)
+            if (
+                ack.get("STATUS") != STATUS_ACK
+                or ack.get("WORKER_UUID") != WORKER_UUID
+            ):
+                raise ValueError(f"ACK inválido: {ack}")
+            print(
+                f"[WORKER] ACK recebido — ciclo concluído para WORKER_UUID={WORKER_UUID}"
+            )
+
         except (
             socket.timeout,
             OSError,
@@ -138,6 +124,8 @@ def run_worker_loop() -> None:
         ) as e:
             print(f"[WORKER] erro: {e}; a tentar de novo...")
             time.sleep(1)
+        finally:
+            sock.close()
 
 
 def main() -> None:

@@ -37,7 +37,7 @@ pytest
 
 Acrescentar `pytest` a `requirements.txt` (linha em ficheiro).
 
-- [ ] **Step 2: Criar `protocol.py` com validações**
+- [x] **Step 2: Criar `protocol.py` com validações**
 
 ```python
 """Mensagens de controlo P2P (valores em MAIÚSCULAS)."""
@@ -70,7 +70,7 @@ def validate_status_report(payload: dict) -> None:
         raise ValueError("WORKER_UUID is required and must be a non-empty string")
 ```
 
-- [ ] **Step 3: Testes unitários — handshake válido e extra fields**
+- [x] **Step 3: Testes unitários — handshake válido e extra fields**
 
 ```python
 import pytest
@@ -127,7 +127,7 @@ git commit -m "feat(sprint2): add protocol validators and unit tests"
 **Files:**
 - Modify: `servidor.py`
 
-- [ ] **Step 1: Imports e estado global partilhado**
+- [x] **Step 1: Imports e estado global partilhado**
 
 No topo de `servidor.py`:
 
@@ -156,14 +156,14 @@ def seed_queue():
 
 Chamar `seed_queue()` em `start_server()` antes de `server_loop(HOST, PORT)`. O Master usa `SERVER_UUID = os.environ.get("P2P_SERVER_UUID", "MASTER_1")`, `HOST`/`PORT` por ambiente.
 
-- [ ] **Step 2: Helper para enviar uma linha JSON**
+- [x] **Step 2: Helper para enviar uma linha JSON**
 
 ```python
 def send_json_line(conn, obj: dict) -> None:
     conn.sendall((json.dumps(obj) + "\n").encode())
 ```
 
-- [ ] **Step 3: Substituir lógica dentro do loop `while "\\n" in buffer`**
+- [x] **Step 3: Substituir lógica dentro do loop `while "\\n" in buffer`**
 
 Após `payload = json.loads(message)`:
 
@@ -198,7 +198,7 @@ git commit -m "feat(sprint2): master queue, pending map, two-phase messages"
 **Files:**
 - Modify: `client.py`
 
-- [ ] **Step 1: Configuração**
+- [x] **Step 1: Configuração**
 
 ```python
 import os
@@ -227,11 +227,11 @@ HEARTBEAT_INTERVAL_SEC = int(os.environ.get("P2P_HEARTBEAT_INTERVAL_SEC", "30"))
 - **Emprestado (CT02):** `P2P_ORIGIN_MASTER_UUID` não vazio → handshake com `SERVER_UUID`.
 - **Heartbeat opcional:** `P2P_ENABLE_HEARTBEAT` ∈ `1`, `true`, `yes`, `on` → thread em fundo com `schedule.every(...).seconds.do(send_heartbeat)` e primeiro envio imediato.
 
-- [ ] **Step 2: Função `recv_json_line(sock) -> dict`**
+- [x] **Step 2: Função `recv_json_line(sock) -> dict`**
 
 Usar `sock.settimeout(READ_TIMEOUT_SEC)`, acumular buffer até `\n`, `json.loads` uma linha, devolver dict. Em `socket.timeout` ou JSON inválido: propagar ou devolver erro para o chamador tratar com mensagem clara.
 
-- [ ] **Step 3: `request_task()` — primeira conexão**
+- [x] **Step 3: `request_task()` — primeira conexão**
 
 Abrir `socket`, `connect`, enviar:
 
@@ -249,7 +249,7 @@ Se `reply.get("TASK") == QUERY` e `"USER" in reply`: retornar tuplo `(reply["USE
 
 Qualquer outro: tratar como erro de protocolo.
 
-- [ ] **Step 4: `report_status(user: str, ok: bool)` — segunda conexão**
+- [x] **Step 4: `report_status(user: str, ok: bool)` — segunda conexão**
 
 Nova conexão; enviar:
 
@@ -266,7 +266,7 @@ Ler resposta; exigir `reply.get("STATUS") == STATUS_ACK` e `reply.get("WORKER_UU
 
 Após confirmar o ACK, logar mensagem com `WORKER_UUID` (ex.: ciclo concluído). O socket é fechado pelo `finally` de `report_status`.
 
-- [ ] **Step 5: `run_worker_loop()`**
+- [x] **Step 5: `run_worker_loop()`**
 
 O worker recebe `A` e `B` junto com a tarefa, calcula `result = A + B`, loga o resultado e passa-o para `report_status`. O `time.sleep` de simulação é removido.
 
