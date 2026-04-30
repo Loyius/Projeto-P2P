@@ -4,9 +4,9 @@
 
 **Goal:** Implementar o ciclo completo Master ↔ Worker (duas conexões TCP curtas por tarefa), com fila no Master, estado pendente por `WORKER_UUID`, JSON + `\n`, parsing estrito, valores de controlo em maiúsculas e timeout de 5 s no worker.
 
-**Architecture:** Master com `deque` + `dict` pendente e `threading.Lock`; dispatch na 1ª mensagem (`WORKER`/`ALIVE`); conclusão na 2ª (`STATUS`/`TASK`/`WORKER_UUID`). Worker: apresentar → receber `QUERY`/`NO_TASK` → se `QUERY`, processar → nova conexão → `ACK`. Validações partilhadas extraídas para `protocol.py` para testes e DRY.
+**Architecture:** Master com `deque` + `dict` pendente e `threading.Lock`; `handle_client` com ramos **HEARTBEAT** (primeiro), relatório **STATUS**/**ACK** e handshake; arranque `start_server()` → `seed_queue()` + `server_loop`. Worker: apresentação (opcional `SERVER_UUID` se emprestado) → `QUERY`/`NO_TASK` → cálculo `A+B` → `RESULT` → `ACK`. Heartbeat periódico **opcional** (`P2P_ENABLE_HEARTBEAT`) em thread com `schedule`. Validações em `protocol.py`; constante de tarefa nomeada **`QUERY`** (não `TASK_QUERY`).
 
-**Tech stack:** Python 3, `socket`, `threading`, `json`, `collections.deque`; testes com `pytest` (adicionar ao projeto).
+**Tech stack:** Python 3, `socket`, `threading`, `json`, `collections.deque`, `schedule` (heartbeat no worker); testes com `pytest` se existir pasta `tests/`.
 
 ---
 
@@ -14,12 +14,11 @@
 
 | Ficheiro | Responsabilidade |
 |----------|------------------|
-| `protocol.py` | Constantes dos valores de controlo; funções `validate_worker_handshake`, `validate_status_report`; helper opcional `read_json_line(sock, timeout_sec)` no worker. |
-| `servidor.py` | Aceitar `HOST`/`PORT` configuráveis (incl. testes); fila inicial; `handle_client` com branches handshake vs status; logs; **fechar conexão sem `ACK`** se validação de status falhar (após log). |
-| `client.py` | UUID do worker; ciclo 1ª/2ª conexão; timeout 5 s em `recv` acumulando até `\n`; espera 30 s após `NO_TASK`; substituir ou conviver com heartbeat — **para esta sprint, priorizar ciclo de tarefas** (heartbeat pode ficar desativado ou em comando separado). |
-| `tests/test_protocol.py` | Testes unitários das validações e de ignorar chaves extra. |
-| `tests/test_sprint2_integration.py` | Servidor em thread + port `0` bind + ciclo feliz e caso `NO_TASK`. |
-| `requirements.txt` | Manter `schedule` se ainda usado; acrescentar `pytest`. |
+| `protocol.py` | Constantes `WORKER_ALIVE`, `QUERY`, `TASK_NO_TASK`, `STATUS_OK`, `STATUS_NOK`, `STATUS_ACK`; `validate_worker_handshake`, `validate_status_report`. |
+| `servidor.py` | `from protocol import *`; `P2P_HOST`/`P2P_PORT`; `P2P_SERVER_UUID` (predef. `MASTER_1`); `task_queue`, `pending_by_worker`, `state_lock`; `seed_queue`, `send_json_line`, `handle_client`, `server_loop`, `start_server`. |
+| `client.py` | `from protocol import *`; `schedule` + heartbeat opcional (`P2P_ENABLE_HEARTBEAT`, `P2P_HEARTBEAT_INTERVAL_SEC`, `HEARTBEAT_SERVER_UUID`); `recv_json_line`, `request_task`, `report_status` (incl. `RESULT`), `run_worker_loop`, `main`. |
+| `tests/test_*.py` | Opcional: integração com servidor em thread (ver código no repositório). |
+| `requirements.txt` | `schedule`; acrescentar `pytest` se se mantiverem testes automatizados. |
 
 ---
 
@@ -45,7 +44,7 @@ Acrescentar `pytest` a `requirements.txt` (linha em ficheiro).
 from __future__ import annotations
 
 WORKER_ALIVE = "ALIVE"
-TASK_QUERY = "QUERY"
+QUERY = "QUERY"
 TASK_NO_TASK = "NO_TASK"
 STATUS_OK = "OK"
 STATUS_NOK = "NOK"
@@ -64,7 +63,7 @@ def validate_status_report(payload: dict) -> None:
     status = payload.get("STATUS")
     if status not in (STATUS_OK, STATUS_NOK):
         raise ValueError("STATUS must be OK or NOK (case-sensitive)")
-    if payload.get("TASK") != TASK_QUERY:
+    if payload.get("TASK") != QUERY:
         raise ValueError("TASK must be QUERY for this report")
     uid = payload.get("WORKER_UUID")
     if not isinstance(uid, str) or not uid:
@@ -76,7 +75,7 @@ def validate_status_report(payload: dict) -> None:
 ```python
 import pytest
 
-from protocol import validate_worker_handshake, validate_status_report, TASK_QUERY
+from protocol import validate_worker_handshake, validate_status_report, QUERY
 from protocol import STATUS_OK, STATUS_NOK
 
 
@@ -98,13 +97,13 @@ def test_handshake_rejects_wrong_alive_case():
 
 def test_status_ok():
     validate_status_report(
-        {"STATUS": "OK", "TASK": TASK_QUERY, "WORKER_UUID": "w1"}
+        {"STATUS": "OK", "TASK": QUERY, "WORKER_UUID": "w1"}
     )
 
 
 def test_status_nok():
     validate_status_report(
-        {"STATUS": "NOK", "TASK": TASK_QUERY, "WORKER_UUID": "w1"}
+        {"STATUS": "NOK", "TASK": QUERY, "WORKER_UUID": "w1"}
     )
 ```
 
@@ -130,20 +129,16 @@ git commit -m "feat(sprint2): add protocol validators and unit tests"
 
 - [ ] **Step 1: Imports e estado global partilhado**
 
-No topo de `servidor.py`, após imports existentes:
+No topo de `servidor.py`:
 
 ```python
 from collections import deque
-from protocol import (
-    TASK_QUERY,
-    TASK_NO_TASK,
-    STATUS_ACK,
-    validate_worker_handshake,
-    validate_status_report,
-)
+from protocol import *
 ```
 
-Criar (substituir constantes soltas se necessário):
+(`QUERY`, `TASK_NO_TASK`, `STATUS_ACK`, `validate_*` vêm do `protocol`.)
+
+Criar:
 
 ```python
 task_queue: deque = deque()
@@ -159,7 +154,7 @@ def seed_queue():
         task_queue.append({"USER": "demo-user", "A": 2, "B": 2})
 ```
 
-Chamar `seed_queue()` em `start_server`/`heartbeat` antes do `listen`, ou expor lista inicial editável.
+Chamar `seed_queue()` em `start_server()` antes de `server_loop(HOST, PORT)`. O Master usa `SERVER_UUID = os.environ.get("P2P_SERVER_UUID", "MASTER_1")`, `HOST`/`PORT` por ambiente.
 
 - [ ] **Step 2: Helper para enviar uma linha JSON**
 
@@ -174,16 +169,16 @@ Após `payload = json.loads(message)`:
 
 1. Tentar interpretar como **relatório de status**: se `"STATUS" in payload` e `"TASK" in payload`:
    - `try: validate_status_report(payload) except ValueError: log; return` e **fechar** tratamento desta mensagem sem ACK (não enviar ACK). **Nota:** distinguir dois casos: (a) `validate_status_report` **lança exceção** (payload malformado, campo ausente, valor inválido) → **não enviar ACK**, fechar conexão após log; (b) `validate_status_report` **passa** e `STATUS == "NOK"` (worker reportou falha legítima na tarefa) → **enviar ACK normalmente**, logar a falha, remover pendente — como no CT05 do projeto.
-   - `wid = payload["WORKER_UUID"]`; com `state_lock`, se `wid` não está em `pending` ou `pending[wid]["USER"]` não coincide com o esperado — na sprint, basta verificar que `pending[wid]` existe e `pending[wid].get("TASK") == TASK_QUERY`; opcionalmente guardar `"USER"` no pendente e exigir igualdade se o relatório incluir `USER` (não obrigatório na spec — não exigir).
-   - Se válido: `print` log com worker, USER do pendente, STATUS; `del pending_by_worker[wid]`; `send_json_line(conn, {"STATUS": STATUS_ACK, "WORKER_UUID": wid})`.
+   - `wid = payload["WORKER_UUID"]`; com `state_lock`, verificar que `pending[wid]` existe e `pending[wid].get("TASK") == QUERY` (constante em `protocol.py`).
+   - Se válido: log incluir `RESULT` se existir; `del pending_by_worker[wid]`; `send_json_line(conn, {"STATUS": STATUS_ACK, "WORKER_UUID": wid})`.
    - Após enviar o ACK, executar `return` imediatamente para encerrar o handler. O bloco `finally` existente chama `conn.close()`, fechando a conexão de forma determinística. Não aguardar mais dados do worker nesta conexão.
 2. **Senão**, tratar como **handshake**:
    - `validate_worker_handshake`; se falhar, log e **não** enviar tarefa.
    - `wid = payload["WORKER_UUID"]`. Verificar `payload.get("SERVER_UUID")`: se presente, logar `[MASTER] Worker {wid} é emprestado do Master {server_uuid}`. Comportamento de despacho de tarefa não se altera — CT02 exige reconhecimento e log, não lógica diferente.
-   - Com lock: se fila vazia → `send_json_line({"TASK": TASK_NO_TASK})`.
-   - Senão: `item = task_queue.popleft()`; `pending_by_worker[wid] = {"TASK": TASK_QUERY, "USER": item["USER"]}`; `send_json_line({"TASK": TASK_QUERY, "USER": item["USER"]})`.
+   - Com lock: se fila vazia → `send_json_line(conn, {"TASK": TASK_NO_TASK})`.
+   - Senão: `item = task_queue.popleft()`; registar `pending_by_worker[wid]` com `TASK: QUERY`, `USER`, `A`, `B` (igual ao payload enviado); `send_json_line` com o mesmo dict `QUERY` + `USER` + `A` + `B`.
 
-Manter compatibilidade: se ainda precisares de HEARTBEAT durante a migração, tratar `payload.get("TASK") == "HEARTBEAT"` num ramo **antes** dos acima, como hoje.
+Manter compatibilidade: ramo **`payload.get("TASK") == "HEARTBEAT"`** **antes** dos ramos de status e handshake — resposta `HEARTBEAT` / `RESPONSE: ALIVE`.
 
 - [ ] **Step 4: Smoke manual**
 
@@ -209,26 +204,28 @@ git commit -m "feat(sprint2): master queue, pending map, two-phase messages"
 import os
 import socket
 import json
+import threading
 import time
-import random
 import uuid
 
-from protocol import (
-    TASK_QUERY,
-    TASK_NO_TASK,
-    STATUS_OK,
-    STATUS_ACK,
-)
+import schedule
+from protocol import *
 
 HOST = os.environ.get("P2P_HOST", "127.0.0.1")
 PORT = int(os.environ.get("P2P_PORT", "5000"))
 WORKER_UUID = os.environ.get("P2P_WORKER_UUID", str(uuid.uuid4()))
 ORIGIN_MASTER_UUID = os.environ.get("P2P_ORIGIN_MASTER_UUID", "").strip()
+HEARTBEAT_SERVER_UUID = os.environ.get(
+    "P2P_HEARTBEAT_SERVER_UUID",
+    os.environ.get("P2P_SERVER_UUID", "MASTER_1"),
+)
 READ_TIMEOUT_SEC = 5.0
 NO_TASK_SLEEP_SEC = 30
+HEARTBEAT_INTERVAL_SEC = int(os.environ.get("P2P_HEARTBEAT_INTERVAL_SEC", "30"))
 ```
 
-- **Emprestado (CT02):** se `P2P_ORIGIN_MASTER_UUID` estiver definido e não vazio, o handshake inclui `SERVER_UUID` com esse valor (Master de origem); o Master regista em log e mantém o despacho igual.
+- **Emprestado (CT02):** `P2P_ORIGIN_MASTER_UUID` não vazio → handshake com `SERVER_UUID`.
+- **Heartbeat opcional:** `P2P_ENABLE_HEARTBEAT` ∈ `1`, `true`, `yes`, `on` → thread em fundo com `schedule.every(...).seconds.do(send_heartbeat)` e primeiro envio imediato.
 
 - [ ] **Step 2: Função `recv_json_line(sock) -> dict`**
 
@@ -248,7 +245,7 @@ reply = recv_json_line(sock)
 
 Se `reply.get("TASK") == TASK_NO_TASK`: fechar; `time.sleep(NO_TASK_SLEEP_SEC)`; retornar `None`.
 
-Se `reply.get("TASK") == TASK_QUERY` e `"USER" in reply`: retornar `reply["USER"]` (e fechar socket).
+Se `reply.get("TASK") == QUERY` e `"USER" in reply`: retornar tuplo `(reply["USER"], reply.get("A"), reply.get("B"))`.
 
 Qualquer outro: tratar como erro de protocolo.
 
@@ -258,15 +255,16 @@ Nova conexão; enviar:
 
 ```python
 body = {
-    "STATUS": STATUS_OK if ok else "NOK",
-    "TASK": TASK_QUERY,
+    "STATUS": STATUS_OK if ok else STATUS_NOK,
+    "TASK": QUERY,
     "WORKER_UUID": WORKER_UUID,
+    "RESULT": result,
 }
 ```
 
-Ler resposta; exigir `reply.get("STATUS") == STATUS_ACK` e `reply.get("WORKER_UUID") == WORKER_UUID` (presença de `WORKER_UUID` no ACK correspondente ao do worker); senão erro.
+Ler resposta; exigir `reply.get("STATUS") == STATUS_ACK` e `reply.get("WORKER_UUID") == WORKER_UUID`; senão erro.
 
-Após confirmar o ACK, logar `[WORKER] ACK recebido — ciclo concluído`. O socket é fechado pelo bloco `finally` imediatamente após.
+Após confirmar o ACK, logar mensagem com `WORKER_UUID` (ex.: ciclo concluído). O socket é fechado pelo `finally` de `report_status`.
 
 - [ ] **Step 5: `run_worker_loop()`**
 
@@ -287,7 +285,7 @@ while True:
         time.sleep(1)
 ```
 
-`if __name__ == "__main__": run_worker_loop()`
+`if __name__ == "__main__": main()` — em `main()`, após logs iniciais, arrancar thread de heartbeat se ativada; depois `run_worker_loop()`.
 
 - [ ] **Step 6: Commit**
 
@@ -304,13 +302,13 @@ git commit -m "feat(sprint2): worker two-phase task cycle with timeouts"
 - Create: `tests/test_sprint2_integration.py`
 - Modify: `servidor.py` (aceitar `PORT=0` e expor `server_socket.getsockname()` se necessário para testes — pode ser feito com fixture que abre servidor em thread)
 
-- [ ] **Step 1: Refator mínimo para teste — função `serve_forever(host, port)`**
+- [ ] **Step 1: Arranque de testes com `server_loop`**
 
-Permitir iniciar o servidor numa porta `0` e ler a porta real com `server_socket.getsockname()[1]` após `bind`. O plano recomenda extrair o corpo de `heartbeat()` para aceitar argumentos.
+O código de produção usa `server_loop(host, port)` em `servidor.py`. Para integração, pode usar-se port `0`, `getsockname()[1]` e threads com `handle_client` (helpers no ficheiro de teste, se existir).
 
 - [ ] **Step 2: Teste ciclo feliz**
 
-Arranjar servidor com fila contendo `{"USER": "u1"}`; worker lógico em Python no mesmo processo: socket 1 handshake → `QUERY`; socket 2 status → `ACK`. Assertions em respostas.
+Fila com item que inclua `USER`, `A`, `B`; handshake → `QUERY` com os três campos; segunda conexão com `STATUS`, `RESULT` e `ACK` com `WORKER_UUID`.
 
 - [ ] **Step 3: Teste `NO_TASK`**
 
@@ -324,7 +322,7 @@ Expected: **PASSED**
 
 - [ ] **Step 5: Self-review do plano vs `docs/superpowers/specs/2026-04-29-sprint2-comunicacao-tarefas-workers-design.md`**
 
-Confirmar cobertura: delimitador `\n`, maiúsculas, ignorar chaves extra, falha sem obrigatórios, 5 s timeout, 30 s após `NO_TASK`, duas conexões, log no Master.
+Confirmar cobertura: delimitador `\n`, constante `QUERY` em `protocol.py`, maiúsculas, ignorar chaves extra, falha sem obrigatórios, 5 s timeout, 30 s após `NO_TASK`, `RESULT` + soma `A+B`, emprestado via `P2P_ORIGIN_MASTER_UUID`, heartbeat opcional (`schedule`), `server_loop` / `P2P_SERVER_UUID`, fecho após `ACK`.
 
 - [ ] **Step 6: Commit**
 
@@ -337,9 +335,9 @@ git commit -m "test(sprint2): integration tests for master-worker task cycle"
 
 ## Revisão do plano (self-review)
 
-1. **Cobertura da spec:** Handshake, `QUERY`/`NO_TASK`, status+`ACK`, fila, pendente, timeouts, espera 30 s, parsing estrito — mapeados às Tarefas 1–4. `SERVER_UUID` opcional: Worker envia via `P2P_ORIGIN_MASTER_UUID` quando emprestado; Master regista em log (CT02 coberto). Fechamento explícito de conexão após ACK implementado em ambos os lados (Master: `return` após `send_json_line` do ACK; Worker: log e `finally` com `sock.close()`). Política explícita: falha de `validate_status_report` ou pendente inexistente → **sem ACK**, conexão termina após possível resposta vazia ou só log (implementação mínima: fechar sem ACK).
+1. **Cobertura da spec:** Handshake, `QUERY`/`NO_TASK` com `A`/`B`, status+`ACK`, `RESULT`, fila, pendente espelhado, timeouts, espera 30 s, parsing estrito. `SERVER_UUID` opcional (emprestado via `P2P_ORIGIN_MASTER_UUID`). Heartbeat opcional no worker (`P2P_ENABLE_HEARTBEAT`, `schedule`). Master: `SERVER_UUID` configurável (`P2P_SERVER_UUID`), ramo HEARTBEAT. Fechamento após ACK (`return` no Master; `finally` no worker). Validações em `protocol.py` com nome **`QUERY`** (não `TASK_QUERY`).
 2. **Placeholders:** Nenhum TBD remanescente nas entregas obrigatórias; fila seed é intencionalmente “demo” configurável pelo aluno.
-3. **Consistência:** Nomes `TASK_QUERY`, funções de validação partilhadas entre master e testes.
+3. **Consistência:** `servidor.py` e `client.py` importam `protocol`; alinhamento dos literais com a spec (maiúsculas).
 
 ---
 

@@ -7,7 +7,7 @@
 
 ## 1. Contexto
 
-Sistema de balanceamento P2P sobre **TCP** com mensagens **JSON** terminadas obrigatoriamente em **`\n`**. Código atual: `servidor.py` (Master) com ciclo **HEARTBEAT**; `client.py` (Worker) envia heartbeat periódico. Esta sprint substitui ou estende esse fluxo pelo **ciclo completo de tarefa** Master ↔ Worker.
+Sistema de balanceamento P2P sobre **TCP** com mensagens **JSON** terminadas obrigatoriamente em **`\n`**. O **ciclo principal** é o de tarefas (handshake → `QUERY`/`NO_TASK` → status → `ACK`). O Master (`servidor.py`) continua a aceitar mensagens **`HEARTBEAT`** (resposta com `RESPONSE: ALIVE`). O Worker (`client.py`) pode ativar heartbeat periódico em **thread em fundo** com `schedule` quando `P2P_ENABLE_HEARTBEAT` está ligado (ligações TCP separadas das duas fases de tarefa).
 
 ---
 
@@ -28,7 +28,8 @@ Sistema de balanceamento P2P sobre **TCP** com mensagens **JSON** terminadas obr
 
 - **Framing:** uma mensagem = um objeto JSON + `\n`.
 - **Parsing estrito (Master):** **ignorar** chaves JSON desconhecidas; **falhar** (fechar conexão ou responder erro de protocolo — ver §5) se **faltar qualquer campo obrigatório** para o tipo de mensagem esperado nesta fase.
-- **Case sensitivity:** valores de controlo **somente em maiúsculas:** `ALIVE`, `QUERY`, `NO_TASK`, `OK`, `NOK`, `ACK`.
+- **Case sensitivity:** valores de controlo **somente em maiúsculas:** `ALIVE`, `QUERY`, `NO_TASK`, `OK`, `NOK`, `ACK`, `HEARTBEAT` (este último só no fluxo opcional de heartbeat).
+- **Constantes partilhadas:** em `protocol.py` os literais expõem-se como `WORKER_ALIVE`, `QUERY`, `TASK_NO_TASK`, `STATUS_OK`, `STATUS_NOK`, `STATUS_ACK`; `servidor.py` e `client.py` importam o módulo conforme o código (ex.: `from protocol import *`).
 
 ### 3.2 Worker → Master (1ª conexão — apresentação)
 
@@ -80,14 +81,24 @@ Exemplo com resultado:
 
 ### 3.5 Timeout (Worker)
 
-- Em **cada** conexão, ao aguardar a **primeira** linha/resposta completa do Master: **máximo 5 s**. Se expirar: tratar como falha, fechar socket e **tentar reconectar** conforme política simples (ex.: retry com backoff leve ou imediato — o plano de implementação fixa o detalhe para evitar loops agressivos).
+- Em **cada** conexão, ao aguardar a **primeira** linha/resposta completa do Master: **máximo 5 s** (`READ_TIMEOUT_SEC` no `client.py`, via `settimeout` em `recv_json_line`). Se expirar: tratar como falha, fechar socket e **tentar reconectar** conforme política simples (ex.: `time.sleep(1)` no ciclo de erros do worker).
+
+### 3.6 Heartbeat opcional (Worker ↔ Master, ligação curta)
+
+- **Não faz parte** do ciclo obrigatório de tarefa; usa **outra** ligação TCP quando ativado.
+- **Worker → Master:** `{"SERVER_UUID": "<string>", "TASK": "HEARTBEAT"}` — o valor de `SERVER_UUID` no payload pode ser configurado com `P2P_HEARTBEAT_SERVER_UUID` ou, por defeito, alinhado a `P2P_SERVER_UUID` / `"MASTER_1"` (`HEARTBEAT_SERVER_UUID` no `client.py`).
+- **Master → Worker:** `{"SERVER_UUID": "<string>", "TASK": "HEARTBEAT", "RESPONSE": "ALIVE"}` (eco do `SERVER_UUID` recebido ou fallback do Master).
+- **Ativação:** variável de ambiente `P2P_ENABLE_HEARTBEAT` ∈ `1`, `true`, `yes`, `on`; primeiro envio imediato, depois intervalo `P2P_HEARTBEAT_INTERVAL_SEC` (predefinição **30**); biblioteca **`schedule`** + **`threading`** no worker.
+- O **identificador do Master** usado nas respostas internas do servidor é `SERVER_UUID = os.environ.get("P2P_SERVER_UUID", "MASTER_1")` em `servidor.py`.
 
 ---
 
 ## 4. Master — fila e estado
 
-- **Fila:** estrutura em memória (lista ou `collections.deque`) de itens de tarefa; mínimo para a sprint: campo `USER` (string) por item; fila inicial pode ser preenchida por código de arranque, CLI ou constantes — ver plano.
-- **Pendentes:** `dict[WORKER_UUID, { "TASK": "QUERY", "USER": "..." }]` (ou estrutura equivalente).
+- **Fila:** `collections.deque` de itens; cada item inclui pelo menos `USER` (string), `A` e `B` (números) para a tarefa de soma. `seed_queue()` no arranque (`start_server()` → `server_loop`) adiciona um item demo `{"USER": "demo-user", "A": 2, "B": 2}`.
+- **Endereço:** `HOST` / `PORT` via `P2P_HOST` / `P2P_PORT` (predefinições `127.0.0.1` e `5000`).
+- **Pendentes:** `dict[WORKER_UUID, { "TASK": "QUERY", "USER": "...", "A": ..., "B": ... }]` — espelha o payload `QUERY` enviado na rede para aquele worker.
+- **Processamento:** `handle_client` trata primeiro `HEARTBEAT`; depois relatório `STATUS` (validação com `validate_status_report` de `protocol.py`, log com `RESULT`, `ACK` + `return`); por fim handshake (`validate_worker_handshake`, log de emprestado se houver `SERVER_UUID`, `NO_TASK` ou despacho `QUERY` com `A`/`B`). Helper `send_json_line`.
 - **Invariantes:**
   - Só existe entrada pendente se o Master enviou `QUERY` a esse worker e ainda não recebeu `STATUS` válido + processou `ACK`.
   - `NO_TASK` **não** cria pendente.
@@ -121,8 +132,9 @@ Exemplo com resultado:
 
 ## Referências no repositório
 
-- `servidor.py` — Master  
-- `client.py` — Worker  
+- `protocol.py` — constantes de controlo, `validate_worker_handshake`, `validate_status_report`
+- `servidor.py` — Master (`server_loop`, `start_server`, `handle_client`)
+- `client.py` — Worker (`request_task`, `report_status`, heartbeat opcional)
 
 ---
 

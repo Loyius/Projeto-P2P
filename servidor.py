@@ -6,11 +6,10 @@ from collections import deque
 from protocol import *
 
 # UUID do servidor
-SERVER_UUID = "MASTER_1"
+SERVER_UUID = os.environ.get("P2P_SERVER_UUID", "MASTER_1")
 
 # Endereço e porta do servidor
 HOST = os.environ.get("P2P_HOST", "127.0.0.1")
-
 PORT = int(os.environ.get("P2P_PORT", "5000"))
 
 # Fila de tarefas
@@ -21,9 +20,9 @@ pending_by_worker: dict[str, dict] = {}
 state_lock = threading.Lock()
 
 
+# Função para inicializar a fila com uma tarefa
 def seed_queue() -> None:
     with state_lock:
-        # Inicializa a fila com uma tarefa de teste com definição dos valores de A e B
         task_queue.append({"USER": "demo-user", "A": 2, "B": 2})
 
 # Função para enviar uma linha JSON para o cliente
@@ -54,6 +53,7 @@ def handle_client(conn: socket.socket, addr) -> None:
                     print(f"[MASTER] Mensagem recebida: {payload}")
                     # Heartbeat
                     if payload.get("TASK") == "HEARTBEAT":
+                        #payload
                         response = {
                             "SERVER_UUID": payload.get("SERVER_UUID", SERVER_UUID),
                             "TASK": "HEARTBEAT",
@@ -62,7 +62,7 @@ def handle_client(conn: socket.socket, addr) -> None:
                         send_json_line(conn, response)
                         continue
                         
-                    # Status report
+                    # Relatório de status
                     if "STATUS" in payload and "TASK" in payload:
                         try:
                             # Validação do status report
@@ -90,6 +90,7 @@ def handle_client(conn: socket.socket, addr) -> None:
                             del pending_by_worker[wid]
 
                         result = payload.get("RESULT")
+
                         print(
                             f"[MASTER] Status worker={wid} USER={user} STATUS={status} RESULT={result}"
                         )
@@ -124,6 +125,7 @@ def handle_client(conn: socket.socket, addr) -> None:
                         else:
                             # Remove a primeira tarefa da fila
                             item = task_queue.popleft()
+
                             # Registra a tarefa pendente para o worker
                             pending_by_worker[wid] = {
                                 "TASK": QUERY,
@@ -131,6 +133,7 @@ def handle_client(conn: socket.socket, addr) -> None:
                                 "A": item["A"],
                                 "B": item["B"],
                             }
+                            #Envia a tarefa pendente para o worker
                             send_json_line(
                                 conn,
                                 {
@@ -140,7 +143,6 @@ def handle_client(conn: socket.socket, addr) -> None:
                                     "B": item["B"],
                                 },
                             )
-
                 except json.JSONDecodeError:
                     print("[MASTER] Erro ao decodificar JSON")
 
