@@ -107,7 +107,7 @@ def test_status_nok():
     )
 ```
 
-- [ ] **Step 4: Correr testes**
+- [x] **Step 4: Correr testes**
 
 Run: `python -m pytest tests/test_protocol.py -v`
 
