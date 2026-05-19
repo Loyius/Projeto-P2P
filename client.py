@@ -33,10 +33,10 @@ def recv_json_line(sock: socket.socket) -> dict:
     sock.settimeout(READ_TIMEOUT_SEC)
     buffer = b""
     while b"\n" not in buffer:
-        chunk = sock.recv(4096)
-        if not chunk:
+        data = sock.recv(4096)
+        if not data:
             raise ConnectionError("conexão fechada antes de linha completa")
-        buffer += chunk
+        buffer += data
     line, _, _ = buffer.partition(b"\n")
     return json.loads(line.decode())
 
@@ -45,13 +45,17 @@ def send_heartbeat() -> None:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
             client.connect((HOST, PORT))
+            
             #payload
             payload = {
                 "SERVER_UUID": HEARTBEAT_SERVER_UUID,
                 "TASK": "HEARTBEAT",
             }
+
             client.sendall((json.dumps(payload) + "\n").encode())
+            
             reply = recv_json_line(client)
+            
             print(f"[WORKER] Resposta recebida: {reply}")
     except Exception as e:
         print(f"[WORKER] Erro de conexão: {e}")
