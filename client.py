@@ -522,8 +522,8 @@ def main() -> None:
             f"[WORKER] Modo emprestado: handshake incluirá SERVER_UUID={ORIGIN_MASTER_UUID} (Master de origem)"
         )
     # Verifica se o heartbeat está ativo via variável de ambiente
-    hb = os.environ.get("P2P_ENABLE_HEARTBEAT", "").strip().lower()
-    if hb in ("1", "true", "yes", "on"):
+    hb = os.environ.get("P2P_ENABLE_HEARTBEAT", "1").strip().lower()
+    if hb not in ("0", "false", "no", "off"):
         # Inicia thread daemon de heartbeat — termina automaticamente quando o processo principal encerra
         threading.Thread(target=_heartbeat_schedule_loop, daemon=True).start()
     # Inicia o ciclo principal — bloqueia aqui até Ctrl+C ou erro fatal

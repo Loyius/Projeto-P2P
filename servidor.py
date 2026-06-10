@@ -80,6 +80,11 @@ borrowed_lock = threading.Lock()
 worker_connections: dict[str, socket.socket] = {}
 worker_conn_lock = threading.Lock()
 
+# Endereço TCP (ip:porta) de cada Worker conectado, capturado no handshake
+# Usado para preencher WORKER_DETAILS.ADDRESS na resposta de request_help
+worker_addresses: dict[str, str] = {}
+worker_addr_lock = threading.Lock()
+
 # Pool de conexões TCP reutilizáveis para comunicação M2M entre Masters
 # Evita abrir/fechar sockets repetidamente para o mesmo vizinho
 m2m_pool: dict[str, socket.socket] = {}
@@ -170,12 +175,14 @@ def _get_idle_workers() -> list[str]:
     """Sprint 03: Retorna lista de Workers locais sem tarefas pendentes.
 
     Um Worker é considerado ocioso se não está em pending_by_worker.
-    Esses são os cand idatos a serem emprestados a Masters vizinhos.
+    Esses são os candidatos a serem emprestados a Masters vizinhos.
+    Ambos os locks são adquiridos juntos para evitar race condition entre
+    a leitura de pending_by_worker e a de local_workers.
     """
     with state_lock:
-        busy = set(pending_by_worker.keys())
-    with local_workers_lock:
-        return [w for w in local_workers if w not in busy]
+        with local_workers_lock:
+            busy = set(pending_by_worker.keys())
+            return [w for w in local_workers if w not in busy]
 
 
 def _log_worker_counts() -> None:
@@ -428,14 +435,16 @@ def handle_m2m_message(msg: dict, conn: socket.socket, peer_addr: str) -> None:
 
         # CT01: tem Workers ociosos → aceita e seleciona os necessários
         selected = idle[:workers_needed]
+        with worker_addr_lock:
+            details = [
+                {"ID": wid, "ADDRESS": worker_addresses.get(wid, f"{HOST}:{PORT}")}
+                for wid in selected
+            ]
         reply = make_m2m_message(
             M2M_RESPONSE_ACCEPTED,
             {
                 "WORKERS_OFFERED": len(selected),
-                "WORKER_DETAILS": [
-                    {"ID": wid, "ADDRESS": f"{HOST}:{PORT}"}
-                    for wid in selected
-                ],
+                "WORKER_DETAILS": details,
             },
             request_id=rid,
         )
@@ -600,7 +609,8 @@ def handle_client(conn: socket.socket, addr) -> None:
                             validate_status_report(payload)
                         except ValueError as e:
                             print(f"[MASTER] Relatório de status inválido: {e}")
-                            return
+                            send_json_line(conn, {"STATUS": "ERROR", "REASON": str(e)})
+                            continue
 
                         wid = payload["WORKER_UUID"]
 
@@ -612,7 +622,8 @@ def handle_client(conn: socket.socket, addr) -> None:
                             )
                             if not ok_pending:
                                 print(f"[MASTER] STATUS sem pendente válido para {wid}")
-                                return
+                                send_json_line(conn, {"STATUS": "ERROR", "REASON": "no_pending_task"})
+                                continue
                             user   = pend.get("USER")
                             status = payload["STATUS"]
                             # Remove da fila de pendentes após confirmar o resultado
@@ -647,16 +658,22 @@ def handle_client(conn: socket.socket, addr) -> None:
                     worker_id_in_session = wid
                     with worker_conn_lock:
                         worker_connections[wid] = conn  # necessário para command_redirect
+                    with worker_addr_lock:
+                        worker_addresses[wid] = f"{addr[0]}:{addr[1]}"
 
                     if server_uuid:
                         print(f"[MASTER] Worker {wid} é emprestado do Master {server_uuid}")
                         # CT04 — registra automaticamente como emprestado se ainda não estiver
+                        orig_addr = next(
+                            (n["address"] for n in NEIGHBOR_MASTERS if n["master_id"] == server_uuid),
+                            "",
+                        )
                         with borrowed_lock:
                             if wid not in borrowed_workers:
                                 borrowed_workers[wid] = {
                                     "WORKER_ID": wid,
                                     "ORIGINAL_MASTER_ID": server_uuid,
-                                    "ORIGINAL_MASTER_ADDRESS": "",
+                                    "ORIGINAL_MASTER_ADDRESS": orig_addr,
                                     "BORROWED_AT": datetime.now(timezone.utc).isoformat(),
                                 }
                         _log_worker_counts()
@@ -695,6 +712,8 @@ def handle_client(conn: socket.socket, addr) -> None:
         if worker_id_in_session:
             with worker_conn_lock:
                 worker_connections.pop(worker_id_in_session, None)
+            with worker_addr_lock:
+                worker_addresses.pop(worker_id_in_session, None)
             with local_workers_lock:
                 local_workers.discard(worker_id_in_session)
         conn.close()
