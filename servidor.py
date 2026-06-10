@@ -16,6 +16,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from protocol import *
+import monitor as _monitor
 
 # ---------------------------------------------------------------------------
 # Configuração (Sprint 01/02 preservada)
@@ -34,6 +35,10 @@ task_queue: deque = deque()
 # Mapa de tarefas atribuídas a Workers ainda não confirmadas (aguardando STATUS)
 # Chave: WORKER_UUID | Valor: dict com TASK, USER, A, B
 pending_by_worker: dict[str, dict] = {}
+
+# Contadores de tarefas para métricas Sprint 04
+tasks_completed_count: int = 0
+tasks_failed_count:    int = 0
 
 # Lock que protege task_queue e pending_by_worker contra acesso concorrente de threads
 state_lock = threading.Lock()
@@ -70,10 +75,15 @@ M2M_TIMEOUT_SEC      = float(os.environ.get("P2P_M2M_TIMEOUT_SEC", "5"))
 local_workers: set[str] = set()
 local_workers_lock = threading.Lock()
 
-# Registro de Workers emprestados de outros Masters
+# Registro de Workers emprestados de outros Masters (recebidos = direction "in")
 # worker_id -> {WORKER_ID, ORIGINAL_MASTER_ID, ORIGINAL_MASTER_ADDRESS, BORROWED_AT}
 borrowed_workers: dict[str, dict] = {}
 borrowed_lock = threading.Lock()
+
+# Registro de Workers enviados (emprestados) para outros Masters (direction "out")
+# worker_id -> peer_master_id (quem recebeu o Worker)
+lent_workers: dict[str, str] = {}
+lent_lock = threading.Lock()
 
 # Mapa de conexões TCP ativas dos Workers (para enviar command_redirect/release assíncrono)
 # Chave: WORKER_UUID | Valor: socket TCP do Worker
@@ -463,6 +473,11 @@ def handle_m2m_message(msg: dict, conn: socket.socket, peer_addr: str) -> None:
             peer_ip = peer_addr.split(":")[0] if ":" in peer_addr else peer_addr
             target_address = f"{peer_ip}:8000"
 
+        # Registra Workers enviados (direction "out") para métricas Sprint 04
+        with lent_lock:
+            for wid in selected:
+                lent_workers[wid] = req_master_id
+
         # Envia command_redirect a cada Worker selecionado para que se reconecte ao Master A
         for wid in selected:
             _send_redirect_to_worker(wid, target_address)
@@ -493,6 +508,9 @@ def handle_m2m_message(msg: dict, conn: socket.socket, peer_addr: str) -> None:
     # ---- notify_worker_returned: Master A nos avisa que devolveu o Worker ----
     elif msg_type == M2M_NOTIFY_RETURNED:
         worker_id = payload.get("WORKER_ID", "")
+        # Remove do registro de Workers enviados (direction "out") — Worker voltou
+        with lent_lock:
+            lent_workers.pop(worker_id, None)
         m2m_log.info(
             "[MASTER] notify_worker_returned recebido: worker_id=%s de %s", worker_id, peer_addr
         )
@@ -637,6 +655,13 @@ def handle_client(conn: socket.socket, addr) -> None:
                         print(
                             f"[MASTER]{tag} Status worker={wid} USER={user} STATUS={status} RESULT={result}"
                         )
+
+                        # Sprint 04: incrementa contadores de tarefas para métricas
+                        global tasks_completed_count, tasks_failed_count
+                        if status == STATUS_OK:
+                            tasks_completed_count += 1
+                        else:
+                            tasks_failed_count += 1
 
                         # Confirma recebimento ao Worker (ACK)
                         send_json_line(conn, {"STATUS": STATUS_ACK, "WORKER_UUID": wid})
@@ -789,6 +814,25 @@ def start_server() -> None:
     threading.Thread(target=_saturation_monitor, daemon=True).start()
     # Sprint 03: inicia sender proativo de heartbeats a Workers conectados
     threading.Thread(target=_master_heartbeat_sender, args=(10.0,), daemon=True).start()
+
+    # Sprint 04: inicia thread de envio de métricas ao Supervisor externo
+    import socket as _socket
+    _ctx = _monitor.MonitorContext(
+        server_uuid           = SERVER_UUID,
+        hostname              = os.environ.get("P2P_HOSTNAME", _socket.gethostname()),
+        saturation_threshold  = SATURATION_THRESHOLD,
+        release_threshold     = RELEASE_THRESHOLD,
+        get_local_workers     = lambda: set(local_workers),
+        get_borrowed_workers  = lambda: dict(borrowed_workers),
+        get_lent_workers      = lambda: dict(lent_workers),
+        get_pending_by_worker = lambda: dict(pending_by_worker),
+        get_task_queue_len    = _get_queue_size,
+        get_tasks_completed   = lambda: tasks_completed_count,
+        get_tasks_failed      = lambda: tasks_failed_count,
+        get_neighbor_masters  = lambda: list(NEIGHBOR_MASTERS),
+    )
+    _monitor.start_monitor(_ctx)
+
     # Inicia o loop do servidor (bloqueia até encerramento)
     server_loop(HOST, PORT)
 
