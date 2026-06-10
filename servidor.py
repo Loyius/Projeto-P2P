@@ -373,6 +373,11 @@ def release_borrowed_worker(worker_id: str) -> None:
     # 3. Remove do registro e loga ciclo de vida completo do Worker emprestado
     with borrowed_lock:
         removed = borrowed_workers.pop(worker_id, None)
+    # Remove antecipadamente de local_workers — o Worker vai desconectar ao receber
+    # command_release, mas o finally de handle_client pode chegar depois do log abaixo,
+    # causando contagem incorreta ("locais=1 emprestados=0") no instante da devolução.
+    with local_workers_lock:
+        local_workers.discard(worker_id)
     if removed:
         m2m_log.info(
             "[MASTER] Ciclo de vida Worker emprestado concluído — worker_id=%s borrowed_at=%s returned_at=%s orig_master=%s",
