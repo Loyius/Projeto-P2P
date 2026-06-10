@@ -26,7 +26,7 @@ import schedule
 # ---------------------------------------------------------------------------
 
 # Endereço IP do Master ao qual o Worker deve se conectar inicialmente
-HOST        = os.environ.get("P2P_HOST", "10.62.217.42")
+HOST        = os.environ.get("P2P_HOST", "192.168.100.87")
 
 # Porta TCP do Master
 PORT        = int(os.environ.get("P2P_PORT", "8000"))

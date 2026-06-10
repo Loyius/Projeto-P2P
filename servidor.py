@@ -25,7 +25,7 @@ from protocol import *
 SERVER_UUID = os.environ.get("P2P_SERVER_UUID", "MASTER_1")
 
 # Endereço e porta em que o servidor vai escutar conexões
-HOST = os.environ.get("P2P_HOST", "10.62.217.42")
+HOST = os.environ.get("P2P_HOST", "192.168.100.87")
 PORT = int(os.environ.get("P2P_PORT", "8000"))
 
 # Fila de tarefas pendentes — Workers consomem desta fila via popleft()
@@ -40,18 +40,22 @@ state_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Sprint 03: Configuração M2M via variáveis de ambiente
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 # Lista de Masters vizinhos para empréstimo de Workers
 # Formato da env: "B=127.0.0.1:6001,C=127.0.0.1:6002"
-_RAW_NEIGHBORS = os.environ.get("P2P_NEIGHBOR_MASTERS", "10.62.217.208:8000").strip()
+_RAW_NEIGHBORS = os.environ.get("P2P_NEIGHBOR_MASTERS", "192.168.100.97:8000").strip()
 NEIGHBOR_MASTERS: list[dict] = []
 for _entry in _RAW_NEIGHBORS.split(","):
     _entry = _entry.strip()
+    if not _entry:
+        continue
     if "=" in _entry:
         _mid, _addr = _entry.split("=", 1)
-        # Cada vizinho é um dict com master_id e address (ip:porta)
         NEIGHBOR_MASTERS.append({"master_id": _mid.strip(), "address": _addr.strip()})
+    else:
+        # Formato sem ID explícito: usa o endereço como identificador
+        NEIGHBOR_MASTERS.append({"master_id": _entry, "address": _entry})
 
 # Tamanho da fila a partir do qual este Master pede ajuda a vizinhos
 SATURATION_THRESHOLD = int(os.environ.get("P2P_SATURATION_THRESHOLD", "5"))
