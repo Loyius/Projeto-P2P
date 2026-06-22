@@ -10,9 +10,11 @@ import json
 import logging
 import os
 import socket
+import ssl
 import threading
 import time
 import uuid
+import psutil
 from collections import deque
 from datetime import datetime, timezone
 from protocol import *
@@ -22,7 +24,10 @@ from protocol import *
 # ---------------------------------------------------------------------------
 
 # Identificador único deste Master — usado em logs e no protocolo M2M
-SERVER_UUID = os.environ.get("P2P_SERVER_UUID", "MASTER_1")
+SERVER_UUID = os.environ.get("P2P_SERVER_UUID", "master_1")
+
+# Hostname reportado ao Supervisor (não usa o hostname real da máquina)
+SERVER_HOSTNAME = os.environ.get("P2P_SERVER_HOSTNAME", "master_1.A.farm.local")
 
 # Endereço e porta em que o servidor vai escutar conexões
 HOST = os.environ.get("P2P_HOST", "192.168.100.87")
@@ -96,6 +101,31 @@ logging.basicConfig(
     level=logging.INFO,
 )
 m2m_log = logging.getLogger("m2m")
+
+# ---------------------------------------------------------------------------
+# Sprint 04: Configuração do Supervisor de Métricas via variáveis de ambiente
+# ---------------------------------------------------------------------------
+METRICS_ENABLED  = os.environ.get("P2P_METRICS_ENABLED", "1").strip() != "0"
+METRICS_INTERVAL = float(os.environ.get("P2P_METRICS_INTERVAL_SEC", "10"))
+SUPERVISOR_HOST  = os.environ.get("P2P_SUPERVISOR_HOST", "nuted-ia.dev").strip()
+SUPERVISOR_PORT  = int(os.environ.get("P2P_SUPERVISOR_PORT", "443"))
+SUPERVISOR_SNI   = os.environ.get("P2P_SUPERVISOR_SNI", "nuted-ia.dev").strip()
+
+_metrics_start_time = time.monotonic()
+_neighbor_last_heartbeat: dict[str, str] = {}
+
+# Contadores de Sprint 04 — alimentam PERFORMANCE.FARM_STATE.{WORKERS,TASKS}
+workers_failed_count = 0
+tasks_completed_count = 0
+tasks_failed_count = 0
+
+# Workers locais que este Master emprestou a outro Master (direção "out")
+# worker_id -> master_id do Master que recebeu o Worker
+lent_out_workers: dict[str, str] = {}
+lent_out_lock = threading.Lock()
+
+metrics_log = logging.getLogger("metrics")
+_metrics_stop_event = threading.Event()
 
 # ---------------------------------------------------------------------------
 # Tarefas (Sprint 01/02 preservadas)
@@ -302,6 +332,7 @@ def request_help_from_neighbors(workers_needed: int) -> None:
             send_json_line(conn, msg)
             reply = recv_json_line(conn, timeout=M2M_TIMEOUT_SEC)
             _log_m2m(f"Master:{mid} →", reply, f"Master:{SERVER_UUID}")
+            _neighbor_last_heartbeat[mid] = _iso_now()
 
             if reply.get("type") == M2M_RESPONSE_ACCEPTED:
                 # Vizinho aceitou — lista de Workers que serão redirecionados para cá
@@ -425,6 +456,9 @@ def handle_m2m_message(msg: dict, conn: socket.socket, peer_addr: str) -> None:
     # ---- request_help: outro Master está sobrecarregado e pede Workers ----
     if msg_type == M2M_REQUEST_HELP:
         workers_needed = payload.get("WORKERS_NEEDED", 1)
+        req_master_id = payload.get("MASTER_ID", "")
+        if req_master_id:
+            _neighbor_last_heartbeat[req_master_id] = _iso_now()
         idle = _get_idle_workers()  # Workers locais sem tarefas pendentes
 
         if not idle:
@@ -457,7 +491,6 @@ def handle_m2m_message(msg: dict, conn: socket.socket, peer_addr: str) -> None:
         send_json_line(conn, reply)
 
         # Determina o endereço correto do Master solicitante para o redirecionamento
-        req_master_id = payload.get("MASTER_ID", "")
         target_address = ""
         for neighbor in NEIGHBOR_MASTERS:
             if neighbor["master_id"] == req_master_id:
@@ -467,6 +500,12 @@ def handle_m2m_message(msg: dict, conn: socket.socket, peer_addr: str) -> None:
             # Fallback: usa o IP do peer com porta padrão 5000
             peer_ip = peer_addr.split(":")[0] if ":" in peer_addr else peer_addr
             target_address = f"{peer_ip}:8000"
+
+        # Sprint 04: marca cada Worker selecionado como emprestado para fora
+        # (direção "out") até que ele desconecte e reconecte ao Master solicitante
+        with lent_out_lock:
+            for wid in selected:
+                lent_out_workers[wid] = req_master_id
 
         # Envia command_redirect a cada Worker selecionado para que se reconecte ao Master A
         for wid in selected:
@@ -498,6 +537,8 @@ def handle_m2m_message(msg: dict, conn: socket.socket, peer_addr: str) -> None:
     # ---- notify_worker_returned: Master A nos avisa que devolveu o Worker ----
     elif msg_type == M2M_NOTIFY_RETURNED:
         worker_id = payload.get("WORKER_ID", "")
+        with lent_out_lock:
+            lent_out_workers.pop(worker_id, None)
         m2m_log.info(
             "[MASTER] notify_worker_returned recebido: worker_id=%s de %s", worker_id, peer_addr
         )
@@ -508,6 +549,188 @@ def handle_m2m_message(msg: dict, conn: socket.socket, peer_addr: str) -> None:
         m2m_log.info(
             "[MASTER] type='%s' recebido de %s request_id=%s (sem ação local)", msg_type, peer_addr, rid
         )
+
+
+# ---------------------------------------------------------------------------
+# Sprint 04: Supervisor de Métricas — montagem e envio do relatório
+# ---------------------------------------------------------------------------
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_metrics_report() -> dict:
+    """Monta o payload de métricas com todas as chaves em MAIÚSCULAS.
+
+    Todos os campos de PERFORMANCE.FARM_STATE.WORKERS são calculados
+    dinamicamente a partir do estado real da farm no momento da chamada
+    (local_workers, borrowed_workers, lent_out_workers, pending_by_worker).
+    """
+    vm = psutil.virtual_memory()
+    du = psutil.disk_usage(os.environ.get("P2P_METRICS_DISK_PATH", os.getcwd()))
+    try:
+        load1, load5, _ = os.getloadavg()
+    except (AttributeError, OSError):
+        load1, load5 = 0.0, 0.0
+
+    with local_workers_lock:
+        total_local = len(local_workers)
+    with borrowed_lock:
+        borrowed_in_list = list(borrowed_workers.values())
+    with lent_out_lock:
+        lent_out_list = list(lent_out_workers.items())
+    with state_lock:
+        tasks_pending = len(task_queue)
+        tasks_running = len(pending_by_worker)
+        oldest_age = 0
+        if task_queue:
+            oldest_age = int(time.time() - task_queue[0].get("enqueued_at", time.time()))
+
+    workers_idle = len(_get_idle_workers())
+
+    borrowed_workers_field = [
+        {"direction": "out", "peer_uuid": peer_id} for _wid, peer_id in lent_out_list
+    ] + [
+        {"direction": "in", "peer_uuid": info.get("ORIGINAL_MASTER_ID", "")}
+        for info in borrowed_in_list
+    ]
+
+    neighbors = []
+    for neighbor in NEIGHBOR_MASTERS:
+        mid = neighbor["master_id"]
+        neighbors.append({
+            "server_uuid": mid,
+            "status": "available" if mid in _neighbor_last_heartbeat else "unavailable",
+            "last_heartbeat": _neighbor_last_heartbeat.get(mid, _iso_now()),
+        })
+
+    return {
+        "server_uuid": SERVER_UUID,
+        "hostname": SERVER_HOSTNAME,
+        "role": "master",
+        "task": "performance_report",
+        "timestamp": _iso_now(),
+        "message_id": str(uuid.uuid4()),
+        "payload_version": "sprint4-monitor",
+        "performance": {
+            "system": {
+                "uptime_seconds": int(time.monotonic() - _metrics_start_time),
+                "load_average_1m": round(load1, 2),
+                "load_average_5m": round(load5, 2),
+                "cpu": {
+                    "usage_percent": psutil.cpu_percent(interval=None),
+                    "count_logical": psutil.cpu_count(logical=True) or 0,
+                    "count_physical": psutil.cpu_count(logical=False) or 0,
+                },
+                "memory": {
+                    "total_mb": int(vm.total / (1024 * 1024)),
+                    "available_mb": int(vm.available / (1024 * 1024)),
+                    "percent_used": vm.percent,
+                    "memory_used": int(vm.used / (1024 * 1024)),
+                },
+                "disk": {
+                    "total_gb": round(du.total / (1024 ** 3), 1),
+                    "free_gb": round(du.free / (1024 ** 3), 1),
+                    "percent_used": du.percent,
+                },
+            },
+            "farm_state": {
+                "workers": {
+                    "total_registered": total_local,
+                    "workers_utilization": tasks_running,
+                    "workers_alive": total_local,
+                    "workers_idle": workers_idle,
+                    "workers_borrowed": len(lent_out_list),
+                    "workers_received": len(borrowed_in_list),
+                    "workers_failed": workers_failed_count,
+                    "workers_home": total_local - len(borrowed_in_list),
+                    "workers_available_capacity": workers_idle,
+                    "borrowed_workers": borrowed_workers_field,
+                },
+                "tasks": {
+                    "tasks_pending": tasks_pending,
+                    "tasks_running": tasks_running,
+                    "tasks_completed": tasks_completed_count,
+                    "tasks_failed": tasks_failed_count,
+                    "oldest_task_age_s": oldest_age,
+                },
+            },
+            "config_thresholds": {
+                "max_task": SATURATION_THRESHOLD,
+                "warn_cpu_percent": int(os.environ.get("P2P_WARN_CPU_PERCENT", "85")),
+                "warn_memory_percent": int(os.environ.get("P2P_WARN_MEMORY_PERCENT", "85")),
+                "release_task": RELEASE_THRESHOLD,
+            },
+            "neighbors": neighbors,
+        },
+    }
+
+
+def _open_supervisor_connection():
+    """Abre uma conexão TLS sobre TCP com o Supervisor. Nunca usa HTTP."""
+    raw_sock = socket.create_connection((SUPERVISOR_HOST, SUPERVISOR_PORT), timeout=5)
+    ctx = ssl.create_default_context()
+    return ctx.wrap_socket(raw_sock, server_hostname=SUPERVISOR_SNI)
+
+
+def _send_metrics_report(report: dict) -> None:
+    """Envia o relatório ao Supervisor: conecta, envia, encerra. Nunca chama recv."""
+    try:
+        with _open_supervisor_connection() as tls_sock:
+            tls_sock.sendall((json.dumps(report) + "\n").encode("utf-8"))
+    except (OSError, ssl.SSLError) as exc:
+        metrics_log.warning("[METRICS] Falha ao enviar relatório ao Supervisor: %s", exc)
+
+
+def _metrics_reporter(stop_event: threading.Event) -> None:
+    """Thread daemon: envia métricas ao Supervisor a cada METRICS_INTERVAL segundos."""
+    while not stop_event.is_set():
+        try:
+            report = build_metrics_report()
+            _send_metrics_report(report)
+        except Exception as exc:  # nunca derruba a thread
+            metrics_log.warning("[METRICS] Erro ao montar/enviar relatório: %s", exc)
+        stop_event.wait(METRICS_INTERVAL)
+
+
+def _maybe_start_metrics_reporter() -> None:
+    if METRICS_ENABLED:
+        threading.Thread(
+            target=_metrics_reporter, args=(_metrics_stop_event,), daemon=True
+        ).start()
+
+
+# ---------------------------------------------------------------------------
+# Sprint 04: Continuidade de tarefas — reatribuição em falha de Worker
+# ---------------------------------------------------------------------------
+def _requeue_task_on_worker_failure(worker_id: str) -> None:
+    """Ao detectar falha de um Worker, devolve a tarefa pendente dele à
+    fila para que outro Worker disponível a retome. Garante continuidade
+    de tarefas mesmo que o Worker original não volte (Sprint 04).
+    """
+    global workers_failed_count
+
+    with state_lock:
+        task = pending_by_worker.pop(worker_id, None)
+        if task is not None:
+            task["retry_count"] = task.get("retry_count", 0) + 1
+            task_queue.appendleft(task)
+
+    with local_workers_lock:
+        local_workers.discard(worker_id)
+    with worker_conn_lock:
+        worker_connections.pop(worker_id, None)
+    with worker_addr_lock:
+        worker_addresses.pop(worker_id, None)
+    with borrowed_lock:
+        borrowed_workers.pop(worker_id, None)
+    with lent_out_lock:
+        lent_out_workers.pop(worker_id, None)
+
+    workers_failed_count += 1
+    metrics_log.warning(
+        "[MASTER] Worker '%s' falhou; tarefa %s reenfileirada para outro Worker",
+        worker_id, task.get("id") if task else "N/A",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +857,13 @@ def handle_client(conn: socket.socket, addr) -> None:
                             # Remove da fila de pendentes após confirmar o resultado
                             del pending_by_worker[wid]
 
+                        # Sprint 04: alimenta TASKS_COMPLETED/TASKS_FAILED do relatório de métricas
+                        global tasks_completed_count, tasks_failed_count
+                        if status == STATUS_OK:
+                            tasks_completed_count += 1
+                        else:
+                            tasks_failed_count += 1
+
                         result = payload.get("RESULT")
                         # Sprint 03: marca no log se o resultado veio de Worker emprestado
                         with borrowed_lock:
@@ -713,14 +943,10 @@ def handle_client(conn: socket.socket, addr) -> None:
     except Exception as e:
         print(f"[MASTER] Erro: {e}")
     finally:
-        # Limpeza ao desconectar: remove Worker dos registros e fecha socket
+        # Sprint 04: limpeza ao desconectar — reenfileira tarefa pendente (se houver)
+        # e remove o Worker de todos os registros, garantindo continuidade da tarefa
         if worker_id_in_session:
-            with worker_conn_lock:
-                worker_connections.pop(worker_id_in_session, None)
-            with worker_addr_lock:
-                worker_addresses.pop(worker_id_in_session, None)
-            with local_workers_lock:
-                local_workers.discard(worker_id_in_session)
+            _requeue_task_on_worker_failure(worker_id_in_session)
         conn.close()
         print(f"[MASTER] Conexão encerrada {addr}")
 
@@ -794,6 +1020,8 @@ def start_server() -> None:
     threading.Thread(target=_saturation_monitor, daemon=True).start()
     # Sprint 03: inicia sender proativo de heartbeats a Workers conectados
     threading.Thread(target=_master_heartbeat_sender, args=(10.0,), daemon=True).start()
+    # Sprint 04: inicia o reporter de métricas ao Supervisor (se habilitado)
+    _maybe_start_metrics_reporter()
     # Inicia o loop do servidor (bloqueia até encerramento)
     server_loop(HOST, PORT)
 
